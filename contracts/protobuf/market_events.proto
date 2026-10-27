@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+package qstream.contracts.v1;
+
+import "google/protobuf/timestamp.proto";
+
+message EventEnvelope {
+  string event_id = 1;
+  string correlation_id = 2;
+  string provider = 3;
+  string dataset = 4;
+  string instrument_id = 5;
+  optional uint64 sequence_number = 6;
+  google.protobuf.Timestamp provider_timestamp = 7;
+  google.protobuf.Timestamp received_timestamp = 8;
+  google.protobuf.Timestamp processed_timestamp = 9;
+  uint32 schema_version = 10;
+  repeated string quality_flags = 11;
+  bool is_simulated = 12;
+}
+
+message TradeEvent {
+  EventEnvelope envelope = 1;
+  string price = 2;
+  string size = 3;
+  optional string exchange = 4;
+  repeated string conditions = 5;
+}
+
+message QuoteEvent {
+  EventEnvelope envelope = 1;
+  string bid_price = 2;
+  string bid_size = 3;
+  string ask_price = 4;
+  string ask_size = 5;
+  optional string bid_exchange = 6;
+  optional string ask_exchange = 7;
+}
+
+message BarEvent {
+  EventEnvelope envelope = 1;
+  string interval = 2;
+  string open = 3;
+  string high = 4;
+  string low = 5;
+  string close = 6;
+  string volume = 7;
+  optional string vwap = 8;
+}
+
