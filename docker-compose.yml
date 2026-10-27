@@ -1,0 +1,181 @@
+name: qstream
+
+x-backend-environment: &backend-environment
+  QSTREAM_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-qstream}:${POSTGRES_PASSWORD:-change-me-local-only}@postgres:5432/${POSTGRES_DB:-qstream}
+  QSTREAM_REDIS_URL: redis://redis:6379/0
+  QSTREAM_KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+  QSTREAM_SCHEMA_REGISTRY_URL: http://redpanda:8081
+  QSTREAM_ALLOWED_ORIGINS: '["http://localhost:${QSTREAM_FRONTEND_PORT:-33000}"]'
+  QSTREAM_S3_ENDPOINT: http://minio:9000
+  QSTREAM_S3_ACCESS_KEY: ${MINIO_ROOT_USER:-qstream}
+  QSTREAM_S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-change-me-local-only}
+  QSTREAM_S3_BUCKET: ${QSTREAM_S3_BUCKET:-qstream-local}
+  QSTREAM_S3_REGION: ${QSTREAM_S3_REGION:-us-east-1}
+  QSTREAM_SEC_USER_AGENT: ${QSTREAM_SEC_USER_AGENT:-}
+  QSTREAM_BEA_API_KEY: ${QSTREAM_BEA_API_KEY:-}
+  QSTREAM_PUBLIC_DATA_TIMEOUT_SECONDS: ${QSTREAM_PUBLIC_DATA_TIMEOUT_SECONDS:-30}
+
+services:
+  postgres:
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-qstream}
+      POSTGRES_USER: ${POSTGRES_USER:-qstream}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-local-only}
+    ports:
+      - "${QSTREAM_POSTGRES_PORT:-55432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/docker/postgres-init.sql:/docker-entrypoint-initdb.d/001-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-qstream} -d ${POSTGRES_DB:-qstream}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${QSTREAM_REDIS_PORT:-56379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redpanda:
+    image: redpandadata/redpanda:v25.2.5
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp=1
+      - --memory=1G
+      - --reserve-memory=0M
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:${QSTREAM_REDPANDA_KAFKA_PORT:-59092}
+      - --schema-registry-addr=0.0.0.0:8081
+      - --rpc-addr=0.0.0.0:33145
+      - --advertise-rpc-addr=redpanda:33145
+    ports:
+      - "${QSTREAM_REDPANDA_KAFKA_PORT:-59092}:19092"
+      - "${QSTREAM_REDPANDA_SCHEMA_PORT:-58081}:8081"
+      - "${QSTREAM_REDPANDA_ADMIN_PORT:-59644}:9644"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health --exit-when-healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  minio:
+    build:
+      context: ./infra/docker/minio
+      args:
+        MINIO_COMMIT: 7aac2a2c5b7c882e68c1ce017d8256be2feea27f
+    image: qstream-minio-community:7aac2a2
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-qstream}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-change-me-local-only}
+    ports:
+      - "${QSTREAM_MINIO_PORT:-59000}:9000"
+      - "${QSTREAM_MINIO_CONSOLE_PORT:-59001}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio-init:
+    build:
+      context: ./backend
+    command: ["python", "-m", "app.services.object_storage"]
+    environment: *backend-environment
+    depends_on:
+      minio:
+        condition: service_healthy
+
+  migrate:
+    build:
+      context: ./backend
+    env_file:
+      - path: .env
+        required: false
+    environment: *backend-environment
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  backend:
+    build:
+      context: ./backend
+    env_file:
+      - path: .env
+        required: false
+    environment: *backend-environment
+    ports:
+      - "${QSTREAM_BACKEND_PORT:-38000}:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  frontend:
+    build:
+      context: ./frontend
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:38000}
+      NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-ws://localhost:38000}
+    ports:
+      - "${QSTREAM_FRONTEND_PORT:-33000}:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    profiles: ["observability"]
+    command: ["--config.file=/etc/prometheus/prometheus.yml"]
+    volumes:
+      - ./infra/monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "${QSTREAM_PROMETHEUS_PORT:-59090}:9090"
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    profiles: ["observability"]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-change-me-local-only}
+    ports:
+      - "${QSTREAM_GRAFANA_PORT:-33001}:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+
+volumes:
+  postgres-data:
+  redis-data:
+  redpanda-data:
+  minio-data:
+  grafana-data:
